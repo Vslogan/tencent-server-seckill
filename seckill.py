@@ -247,6 +247,8 @@ async def sync_time(page):
     for _ in range(SAMPLES):
         await one_sample()
         await asyncio.sleep(0.15)
+    if len(offsets) < SAMPLES:
+        log(f"对时采样成功 {len(offsets)}/{SAMPLES} 次，失败的采样未计入")
 
     if offsets:
         offsets.sort()
@@ -269,47 +271,173 @@ async def sync_time(page):
     return offset
 
 
-async def api_do_goods(page, goods, attempt):
-    """在浏览器上下文中调用 do-goods API"""
-    result = await page.evaluate("""
-        async (params) => {
-            try {
-                const resp = await fetch(params.url, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
-                    credentials: 'include',
-                    body: JSON.stringify({
-                        activity_id: params.activity_id,
-                        goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
-                        agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
-                        preview: 0,
-                    }),
-                });
-                return await resp.json();
-            } catch(e) {
-                return {code: -1, msg: e.message};
-            }
+# ============================================================
+# do-goods 请求与结果记录（调试日志）
+# ============================================================
+
+def dlog(msg):
+    """只写入日志文件、不输出到控制台：逐次请求的详细记录，避免刷屏"""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat()}] [DEBUG] {msg}\n")
+    except UnicodeEncodeError:
+        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"[{datetime.now().isoformat()}] [DEBUG] {msg}\n")
+
+
+# 单次 do-goods 请求，在页面上下文执行（Cookie / CSRF 由浏览器带上）。
+# 返回对象 = 服务端 JSON + 调试字段：
+#   _http     HTTP 状态码（网络异常为 0）
+#   _ms       请求耗时（毫秒）
+#   _csrf_len 发送时 x-csrf-token 的长度（为 0 说明 hook 还没捕获到 token）
+# 非 JSON 响应（登录页 / 风控页等）和网络异常也包装成带 code 的对象，统一记录原因。
+DO_ONE_JS = """
+async (params) => {
+    const t0 = performance.now();
+    const csrf = window.__latestCsrf || '';
+    const dbg = {_csrf_len: csrf.length};
+    try {
+        const resp = await fetch(params.url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'x-csrf-token': csrf},
+            credentials: 'include',
+            body: JSON.stringify({
+                activity_id: params.activity_id,
+                goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
+                agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
+                preview: 0,
+            }),
+        });
+        const text = await resp.text();
+        const ms = Math.round(performance.now() - t0);
+        let j = null;
+        try { j = JSON.parse(text); } catch (e) { j = null; }
+        if (j === null || typeof j !== 'object' || Array.isArray(j)) {
+            return {...dbg, code: 'HTTP' + resp.status + '-非JSON', msg: '响应不是 JSON',
+                    _http: resp.status, _ms: ms, _raw: text.slice(0, 300)};
         }
-    """, {
+        return {...j, ...dbg, _http: resp.status, _ms: ms};
+    } catch (e) {
+        return {...dbg, code: -1, msg: 'fetch异常: ' + e.message,
+                _http: 0, _ms: Math.round(performance.now() - t0)};
+    }
+}
+"""
+
+# 一批 CONCURRENCY 个并发请求
+BATCH_JS = ("(params) => Promise.all(Array.from({length: params.concurrency}, () => ("
+            + DO_ONE_JS.strip() + ")(params)))")
+
+
+def _do_goods_params(goods):
+    return {
         "url": DO_GOODS_URL,
         "activity_id": goods["activity_id"],
         "act_id": goods["act_id"],
         "type": goods["type"],
         "goods_param": goods.get("goods_param", {}),
-    })
+        "concurrency": CONCURRENCY,
+    }
 
-    code = result.get("code")
-    msg = result.get("msg", "")
 
-    if code == 0:
-        deal = result.get("data", {})
+def _reason_key(r):
+    """把一次返回归类成一个原因键，用于统计分布"""
+    return f"code={r.get('code')} msg={str(r.get('msg') or '')[:60]}"
+
+
+def _brief(r):
+    return f"{_reason_key(r)} http={r.get('_http')} {r.get('_ms')}ms"
+
+
+def _snippet(r, limit=400):
+    """完整原文（截断），用于判断具体原因"""
+    try:
+        s = json.dumps(r, ensure_ascii=False)
+    except (TypeError, ValueError):
+        s = str(r)
+    return s if len(s) <= limit else s[:limit] + "...(截断)"
+
+
+class PurchaseStats:
+    """统计每次抢购请求的返回，抢购结束时输出原因分布"""
+
+    def __init__(self):
+        self.total = 0
+        self.counts = {}      # 原因键 -> 次数
+        self.samples = {}     # 原因键 -> 首次出现的原文
+        self.http = {}        # HTTP 状态 -> 次数
+        self.latency = []     # 每次请求耗时(ms)
+        self.csrf_empty = 0   # 发送时 CSRF token 为空的次数
+
+    def add(self, r):
+        key = _reason_key(r)
+        self.total += 1
+        self.counts[key] = self.counts.get(key, 0) + 1
+        self.samples.setdefault(key, _snippet(r))
+        h = str(r.get("_http"))
+        self.http[h] = self.http.get(h, 0) + 1
+        if isinstance(r.get("_ms"), (int, float)):
+            self.latency.append(r["_ms"])
+        if r.get("_csrf_len") == 0:
+            self.csrf_empty += 1
+        return key
+
+
+def _diagnose(stats):
+    """根据返回分布给出未抢到的可能原因（只做提示，结论以原文为准）"""
+    if stats.total == 0:
+        return "一次请求都没有发出"
+    keys = list(stats.counts)
+    hints = []
+    if len(keys) == 1:
+        hints.append(f"全部 {stats.total} 次请求返回相同结果")
+    if stats.csrf_empty:
+        hints.append(f"{stats.csrf_empty}/{stats.total} 次请求发送时 CSRF token 为空，"
+                     "请检查活动页是否加载完成、登录态是否有效")
+    if any(k.startswith("code=-1") for k in keys):
+        hints.append("存在 fetch 网络异常（连接中断、页面跳转等）")
+    if any("非JSON" in k for k in keys):
+        hints.append("服务端返回了非 JSON 响应（可能是登录过期、风控或网关拦截）")
+    non200 = sum(n for h, n in stats.http.items() if h not in ("200", "0"))
+    if non200:
+        hints.append(f"{non200} 次 HTTP 状态非 200，见上方 HTTP 分布")
+    if any("登录" in k for k in keys):
+        hints.append("返回信息提示需要登录，登录态可能已失效")
+    if not hints:
+        hints.append("请结合上方各类返回的 msg 原文判断")
+    return "；".join(hints)
+
+
+def _log_purchase_summary(stats, success):
+    if stats.total == 0:
+        log("抢购统计: 没有任何请求返回")
+        return
+    log(f"抢购统计: 共 {stats.total} 次请求，返回分布:")
+    for key, n in sorted(stats.counts.items(), key=lambda kv: -kv[1]):
+        log(f"  {n:>6} 次  {key}")
+        log(f"           原文示例: {stats.samples[key]}")
+    log(f"  HTTP 状态分布: {stats.http}")
+    if stats.latency:
+        lat = sorted(stats.latency)
+        log(f"  请求耗时(ms): 最小 {lat[0]} / 中位 {lat[len(lat) // 2]} / 最大 {lat[-1]}")
+    if not success:
+        log(f"未抢到原因判断: {_diagnose(stats)}")
+
+
+async def api_do_goods(page, goods, attempt):
+    """单次 do-goods 请求（预热用），返回是否下单成功，并记录结果/原因"""
+    r = await page.evaluate(DO_ONE_JS, _do_goods_params(goods))
+    dlog(f"单次请求 #{attempt} 原文: {_snippet(r, 1000)}")
+
+    if r.get("code") == 0:
+        deal = r.get("data") or {}
         log(f"下单成功 #{attempt}")
-        log(f"   订单号: {deal.get('deal_names', ['?'])[0]}")
+        log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
         log(f"   大单号: {deal.get('big_deal_no', '?')}")
         return True
-    elif attempt <= 5 or code != 1435936:
-        if attempt <= 10:
-            log(f"  #{attempt} code={code} msg={msg[:60]}")
+
+    log(f"  请求 #{attempt} 未成功: {_brief(r)}")
+    dlog(f"  未成功 msg 全文: {r.get('msg')}")
     return False
 
 
@@ -317,75 +445,62 @@ async def warmup(page, goods):
     """预热连接：提前发一个请求建立TCP/TLS，到点直接用"""
     log("预热连接...")
     result = await api_do_goods(page, goods, 0)
-    log(f"  预热完成 (结果: {'成功' if result else '未到时间，正常'})")
+    log(f"  预热完成 (下单结果: {'成功' if result else '未成功，原因见上'})")
 
 
 async def rapid_purchase(page, goods, duration=DURATION_SEC):
-    """并发调 API，每次 evaluate 发一批请求"""
+    """并发调 API，每次 evaluate 发一批请求。逐轮记录结果，结束时输出原因统计"""
+    params = _do_goods_params(goods)
+    gp = goods.get("goods_param", {})
     log(f"开始抢购：并发={CONCURRENCY}，间隔={ROUND_INTERVAL_MS}ms，持续={duration}s")
+    log(f"请求参数: act_id={goods['act_id']} activity_id={goods['activity_id']} "
+        f"type={goods['type']} regionId={gp.get('regionId')}")
 
+    stats = PurchaseStats()
+    seen = set()
     start = time.monotonic()
     attempt = 0
+    rounds = 0
     success = False
 
-    while time.monotonic() - start < duration:
-        # 批量发起：一次 evaluate 发 CONCURRENCY 个并发 fetch
-        batch_result = await page.evaluate("""
-            async (params) => {
-                const results = [];
-                const promises = [];
-                for (let i = 0; i < params.concurrency; i++) {
-                    promises.push(
-                        fetch(params.url, {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
-                            credentials: 'include',
-                            body: JSON.stringify({
-                                activity_id: params.activity_id,
-                                goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
-                                agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
-                                preview: 0,
-                            }),
-                        })
-                        .then(r => r.json())
-                        .catch(e => ({code: -1, msg: e.message}))
-                    );
-                }
-                return await Promise.all(promises);
-            }
-        """, {
-            "url": DO_GOODS_URL,
-            "activity_id": goods["activity_id"],
-            "act_id": goods["act_id"],
-            "type": goods["type"],
-            "goods_param": goods.get("goods_param", {}),
-            "concurrency": CONCURRENCY,
-        })
+    try:
+        while time.monotonic() - start < duration:
+            rounds += 1
+            t0 = time.monotonic()
+            batch = await page.evaluate(BATCH_JS, params)
+            batch_ms = (time.monotonic() - t0) * 1000
+            attempt += len(batch)
 
-        attempt += CONCURRENCY
+            for r in batch:
+                key = stats.add(r)
+                if key not in seen:
+                    seen.add(key)
+                    log(f"  [第{rounds}轮] 新的返回类型: {key}")
+                    log(f"           原文: {stats.samples[key]}")
 
-        # 检查结果
-        for r in batch_result:
-            code = r.get("code")
-            if code == 0:
-                deal = r.get("data", {})
-                log("下单成功")
-                log(f"   订单号: {deal.get('deal_names', ['?'])[0]}")
+            # 每轮的完整记录只写文件
+            dlog(f"[第{rounds}轮 批耗时{batch_ms:.0f}ms] " + " | ".join(_brief(r) for r in batch))
+
+            ok = [r for r in batch if r.get("code") == 0]
+            if ok:
+                deal = ok[0].get("data") or {}
+                log(f"下单成功！第{rounds}轮（累计 {attempt} 次请求，本轮成功 {len(ok)}/{len(batch)} 条）")
+                log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
                 log(f"   大单号: {deal.get('big_deal_no', '?')}")
+                dlog(f"   成功原文: {_snippet(ok[0], 1000)}")
                 success = True
                 break
 
-        if success:
-            break
+            if rounds % 20 == 0:
+                log(f"  已尝试 {attempt} 次 ({time.monotonic() - start:.1f}s)")
 
-        if attempt % (CONCURRENCY * 20) == 0:
-            elapsed = time.monotonic() - start
-            log(f"  已尝试 {attempt} 次 ({elapsed:.1f}s)")
+            await asyncio.sleep(ROUND_INTERVAL_MS / 1000)
+    finally:
+        # 无论正常结束、被中断还是异常，都输出统计，方便定位原因
+        elapsed = time.monotonic() - start
+        log(f"抢购结束: {attempt} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
+        _log_purchase_summary(stats, success)
 
-        await asyncio.sleep(ROUND_INTERVAL_MS / 1000)
-
-    elapsed = time.monotonic() - start
-    log(f"抢购结束: {attempt} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
     return success
 
 
@@ -454,6 +569,8 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
             await asyncio.sleep(0.2)
         else:
             log("未捕获到 CSRF token，请求可能失败")
+        csrf_len = await page.evaluate("() => (window.__latestCsrf || '').length")
+        log(f"CSRF token 长度: {csrf_len}" + ("" if csrf_len else "（为空，下单请求大概率失败）"))
 
         if test_mode:
             log("测试模式: 直接调用 do-goods")
