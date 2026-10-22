@@ -49,11 +49,11 @@ FLASH_SALE = {
         "area": 1,
         "ddocUnionConnect": 0,
         "goodsNum": 1,
-        "imageId": "lhbp-eqora508",
+        "imageId": "lhbp-1l4ptuvm",
         "scenario": "0",
         "timeSpanUnit": "12m",
         "zone": "",
-        "regionId": 8,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
+        "regionId": 1,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
         "type": "bundle_budget_mc_lg4_01",
     },
 }
@@ -69,11 +69,11 @@ TEST_GOODS = {
         "area": 1,
         "ddocUnionConnect": 0,
         "goodsNum": 1,
-        "imageId": "lhbp-eqora508",
+        "imageId": "lhbp-1l4ptuvm",
         "scenario": "0",
         "timeSpanUnit": "12m",
         "zone": "",
-        "regionId": 8,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
+        "regionId": 1,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
         "type": "bundle_budget_mc_lg4_01",
     },
 }
@@ -90,7 +90,7 @@ DURATION_SEC = 10
 ROUND_INTERVAL_MS = 20
 
 # 提前多少毫秒开始发请求 (负数=提前，-3000=提前3秒)
-ADVANCE_MS = -3000
+ADVANCE_MS = -1000
 
 # 提前多少秒开始预热连接 (在目标时间前)
 WARMUP_SECONDS = 10
